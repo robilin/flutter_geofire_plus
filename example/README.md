@@ -1,4 +1,4 @@
-# flutter_geofire example
+# flutter_geofire_plus example
 
 This example demonstrates a realistic driver/rider flow for ride dispatch:
 

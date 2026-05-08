@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_geofire/flutter_geofire.dart';
+import 'package:flutter_geofire_plus/flutter_geofire_plus.dart';
 
 const String _pathToReference = 'drivers_live';
 const String _demoDriverId = 'driver_demo_001';

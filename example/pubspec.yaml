@@ -1,5 +1,5 @@
 name: geofire_example
-description: Demonstrates how to use the flutter_geofire plugin.
+description: Demonstrates how to use the flutter_geofire_plus plugin.
 publish_to: 'none'
 
 environment:
@@ -21,7 +21,7 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
 
-  flutter_geofire:
+  flutter_geofire_plus:
     path: ../
 
 # For information on the generic Dart part of this file, see the

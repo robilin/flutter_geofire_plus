@@ -1,5 +1,5 @@
-name: flutter_geofire
-description: A Flutter plugin to get the realtime updates of places nearby. GeoFire is an open-source library for that allows you to store and query a set of keys based on their geographic location.
+name: flutter_geofire_plus
+description: A Flutter plugin for realtime geospatial proximity queries with multi-backend support (Firebase, Firestore, Supabase, Postgres, MySQL), typed APIs, ride-dispatch helpers, and native background location tracking.
 version: 2.0.7
 
 

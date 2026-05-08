@@ -1,4 +1,4 @@
-# flutter_geofire
+# flutter_geofire_plus
 
 A Flutter plugin for realtime geospatial location updates and proximity queries.
 
@@ -15,7 +15,7 @@ In pubspec.yaml:
 
 ```yaml
 dependencies:
-  flutter_geofire: ^2.0.7
+  flutter_geofire_plus: ^2.0.7
 ```
 
 Then run:
@@ -52,7 +52,7 @@ If you use native location tracking, request runtime location permissions in you
 ## Quickstart (Firebase default backend)
 
 ```dart
-import 'package:flutter_geofire/flutter_geofire.dart';
+import 'package:flutter_geofire_plus/flutter_geofire_plus.dart';
 
 Future<void> setup() async {
   final bool ok = await Geofire.initialize('drivers_live');
@@ -95,7 +95,7 @@ Realtime Database rules must index g for your chosen path:
 ### Template A: Driver app publisher (Dart-driven updates)
 
 ```dart
-import 'package:flutter_geofire/flutter_geofire.dart';
+import 'package:flutter_geofire_plus/flutter_geofire_plus.dart';
 
 class DriverPublisher {
   static const String path = 'drivers_live';
@@ -135,7 +135,7 @@ class DriverPublisher {
 
 ```dart
 import 'dart:async';
-import 'package:flutter_geofire/flutter_geofire.dart';
+import 'package:flutter_geofire_plus/flutter_geofire_plus.dart';
 
 class RiderMatching {
   static const String path = 'drivers_live';
@@ -180,7 +180,7 @@ class RiderMatching {
 ### Template C: Native tracker mode (platform-driven updates)
 
 ```dart
-import 'package:flutter_geofire/flutter_geofire.dart';
+import 'package:flutter_geofire_plus/flutter_geofire_plus.dart';
 
 class NativeTracker {
   static const String path = 'drivers_live';
