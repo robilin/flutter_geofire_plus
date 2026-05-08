@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
 
 typedef GeofireScoreBuilder = double Function(Map<String, dynamic> event);
 typedef GeofireDriverScoreBuilder = double Function(
@@ -142,24 +144,43 @@ class GeofireDriverCandidate {
   final GeofireDriverEvent sourceEvent;
 }
 
-class Geofire {
-  static const MethodChannel _channel = MethodChannel('geofire');
-  static const EventChannel _stream = EventChannel('geofireStream');
+abstract class GeofireBackend {
+  Future<bool> initialize(String path);
 
-  static const onKeyEntered = 'onKeyEntered';
-  static const onGeoQueryReady = 'onGeoQueryReady';
-  static const onKeyMoved = 'onKeyMoved';
-  static const onKeyExited = 'onKeyExited';
+  Future<bool?> setLocation(String id, double latitude, double longitude,
+      {Map<String, dynamic>? data});
 
-  static Stream<dynamic>? _queryAtLocation;
+  Future<bool?> removeLocation(String id);
 
-  static Future<bool> initialize(String path) async {
+  Future<Map<String, dynamic>> getLocation(String id);
+
+  Stream<dynamic> queryAtLocation(double lat, double lng, double radius,
+      {bool includeData = false});
+
+  Future<bool?> stopListener();
+}
+
+class MethodChannelGeofireBackend implements GeofireBackend {
+  MethodChannelGeofireBackend({
+    MethodChannel? channel,
+    EventChannel? stream,
+  })  : _channel = channel ?? const MethodChannel('geofire'),
+        _stream = stream ?? const EventChannel('geofireStream');
+
+  final MethodChannel _channel;
+  final EventChannel _stream;
+
+  Stream<dynamic>? _queryAtLocation;
+
+  @override
+  Future<bool> initialize(String path) async {
     final dynamic r = await _channel
         .invokeMethod('GeoFire.start', <String, dynamic>{'path': path});
     return r ?? false;
   }
 
-  static Future<bool?> setLocation(String id, double latitude, double longitude,
+  @override
+  Future<bool?> setLocation(String id, double latitude, double longitude,
       {Map<String, dynamic>? data}) async {
     final Map<String, dynamic> payload = <String, dynamic>{
       'id': id,
@@ -177,19 +198,13 @@ class Geofire {
     return isSet;
   }
 
-  static Future<bool?> removeLocation(String id) async {
-    final bool? isSet = await _channel
-        .invokeMethod('removeLocation', <String, dynamic>{'id': id});
-    return isSet;
+  @override
+  Future<bool?> removeLocation(String id) async {
+    return _channel.invokeMethod('removeLocation', <String, dynamic>{'id': id});
   }
 
-  static Future<bool?> stopListener() async {
-    final bool? isSet =
-        await _channel.invokeMethod('stopListener', <String, dynamic>{});
-    return isSet;
-  }
-
-  static Future<Map<String, dynamic>> getLocation(String id) async {
+  @override
+  Future<Map<String, dynamic>> getLocation(String id) async {
     final Map<dynamic, dynamic> response = await (_channel
         .invokeMethod('getLocation', <String, dynamic>{'id': id}));
 
@@ -201,7 +216,8 @@ class Geofire {
     return location;
   }
 
-  static Stream<dynamic>? queryAtLocation(double lat, double lng, double radius,
+  @override
+  Stream<dynamic> queryAtLocation(double lat, double lng, double radius,
       {bool includeData = false}) {
     _channel.invokeMethod('queryAtLocation', <String, dynamic>{
       'lat': lat,
@@ -214,10 +230,357 @@ class Geofire {
       // no-op
     });
 
-    if (_queryAtLocation == null) {
-      _queryAtLocation = _stream.receiveBroadcastStream();
+    _queryAtLocation ??= _stream.receiveBroadcastStream();
+    return _queryAtLocation!;
+  }
+
+  @override
+  Future<bool?> stopListener() async {
+    return _channel.invokeMethod('stopListener', <String, dynamic>{});
+  }
+}
+
+class RestGeofireBackend implements GeofireBackend {
+  RestGeofireBackend({
+    required this.baseUrl,
+    this.headers = const <String, String>{},
+    this.pollInterval = const Duration(seconds: 2),
+    http.Client? client,
+  }) : _client = client ?? http.Client();
+
+  final String baseUrl;
+  final Map<String, String> headers;
+  final Duration pollInterval;
+  final http.Client _client;
+
+  String? _path;
+  StreamController<dynamic>? _controller;
+  Timer? _pollTimer;
+
+  double? _queryLat;
+  double? _queryLng;
+  double? _queryRadius;
+  bool _includeData = false;
+
+  bool _hasSentReady = false;
+  Map<String, Map<String, dynamic>> _lastResultsByKey =
+      <String, Map<String, dynamic>>{};
+
+  @override
+  Future<bool> initialize(String path) async {
+    _path = path;
+
+    final Uri uri = _uri('/initialize');
+    final http.Response response = await _client.post(
+      uri,
+      headers: _jsonHeaders,
+      body: jsonEncode(<String, dynamic>{'path': path}),
+    );
+
+    return response.statusCode >= 200 && response.statusCode < 300;
+  }
+
+  @override
+  Future<bool?> setLocation(String id, double latitude, double longitude,
+      {Map<String, dynamic>? data}) async {
+    final Uri uri = _uri('/set-location');
+    final http.Response response = await _client.post(
+      uri,
+      headers: _jsonHeaders,
+      body: jsonEncode(<String, dynamic>{
+        'path': _path,
+        'id': id,
+        'lat': latitude,
+        'lng': longitude,
+        'data': data ?? <String, dynamic>{},
+      }),
+    );
+
+    return response.statusCode >= 200 && response.statusCode < 300;
+  }
+
+  @override
+  Future<bool?> removeLocation(String id) async {
+    final Uri uri = _uri('/remove-location');
+    final http.Response response = await _client.post(
+      uri,
+      headers: _jsonHeaders,
+      body: jsonEncode(<String, dynamic>{'path': _path, 'id': id}),
+    );
+
+    return response.statusCode >= 200 && response.statusCode < 300;
+  }
+
+  @override
+  Future<Map<String, dynamic>> getLocation(String id) async {
+    final Uri uri = _uri('/get-location').replace(
+      queryParameters: <String, String>{
+        'path': _path ?? '',
+        'id': id,
+      },
+    );
+
+    final http.Response response = await _client.get(uri, headers: headers);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      return <String, dynamic>{'error': 'Request failed'};
     }
-    return _queryAtLocation;
+
+    final Object? decoded = jsonDecode(response.body);
+    if (decoded is Map) {
+      return Map<String, dynamic>.from(decoded);
+    }
+
+    return <String, dynamic>{'error': 'Invalid response'};
+  }
+
+  @override
+  Stream<dynamic> queryAtLocation(double lat, double lng, double radius,
+      {bool includeData = false}) {
+    _queryLat = lat;
+    _queryLng = lng;
+    _queryRadius = radius;
+    _includeData = includeData;
+
+    _controller ??= StreamController<dynamic>.broadcast(
+      onCancel: () {
+        if (!(_controller?.hasListener ?? false)) {
+          _pollTimer?.cancel();
+          _pollTimer = null;
+        }
+      },
+    );
+
+    _lastResultsByKey = <String, Map<String, dynamic>>{};
+    _hasSentReady = false;
+
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(pollInterval, (_) {
+      _pollQuery();
+    });
+    _pollQuery();
+
+    return _controller!.stream;
+  }
+
+  @override
+  Future<bool?> stopListener() async {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    _controller?.add(<String, dynamic>{
+      'callBack': Geofire.onGeoQueryReady,
+      'result': <String>[],
+    });
+    return true;
+  }
+
+  Future<void> _pollQuery() async {
+    if (_controller == null ||
+        _queryLat == null ||
+        _queryLng == null ||
+        _queryRadius == null) {
+      return;
+    }
+
+    final Uri uri = _uri('/query').replace(
+      queryParameters: <String, String>{
+        'path': _path ?? '',
+        'lat': _queryLat.toString(),
+        'lng': _queryLng.toString(),
+        'radius': _queryRadius.toString(),
+        'includeData': _includeData.toString(),
+      },
+    );
+
+    final http.Response response = await _client.get(uri, headers: headers);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      return;
+    }
+
+    final Object? decoded = jsonDecode(response.body);
+    if (decoded is! List) {
+      return;
+    }
+
+    final List<dynamic> rows = decoded;
+    final Map<String, Map<String, dynamic>> currentByKey =
+        <String, Map<String, dynamic>>{};
+
+    for (final dynamic row in rows) {
+      if (row is! Map) {
+        continue;
+      }
+
+      final Map<String, dynamic> value = Map<String, dynamic>.from(row);
+      final String key = (value['key'] ?? '').toString();
+      if (key.isEmpty) {
+        continue;
+      }
+      currentByKey[key] = value;
+    }
+
+    for (final MapEntry<String, Map<String, dynamic>> entry
+        in currentByKey.entries) {
+      final String key = entry.key;
+      final Map<String, dynamic> current = entry.value;
+      final Map<String, dynamic>? previous = _lastResultsByKey[key];
+
+      final Map<String, dynamic> payload = <String, dynamic>{
+        'key': key,
+        'latitude': _asDouble(current['latitude'] ?? current['lat']),
+        'longitude': _asDouble(current['longitude'] ?? current['lng']),
+      };
+
+      if (_includeData && current['data'] is Map) {
+        payload['data'] = current['data'];
+      }
+
+      if (previous == null) {
+        payload['callBack'] = Geofire.onKeyEntered;
+        _controller?.add(payload);
+      } else {
+        final double? prevLat =
+            _asDouble(previous['latitude'] ?? previous['lat']);
+        final double? prevLng =
+            _asDouble(previous['longitude'] ?? previous['lng']);
+        final double? curLat = _asDouble(payload['latitude']);
+        final double? curLng = _asDouble(payload['longitude']);
+
+        if (prevLat != curLat || prevLng != curLng) {
+          payload['callBack'] = Geofire.onKeyMoved;
+          _controller?.add(payload);
+        }
+      }
+    }
+
+    for (final String previousKey in _lastResultsByKey.keys) {
+      if (!currentByKey.containsKey(previousKey)) {
+        _controller?.add(<String, dynamic>{
+          'callBack': Geofire.onKeyExited,
+          'key': previousKey,
+        });
+      }
+    }
+
+    if (!_hasSentReady) {
+      _hasSentReady = true;
+      _controller?.add(<String, dynamic>{
+        'callBack': Geofire.onGeoQueryReady,
+        'result': currentByKey.keys.toList(),
+      });
+    }
+
+    _lastResultsByKey = currentByKey;
+  }
+
+  Uri _uri(String path) => Uri.parse('$baseUrl$path');
+
+  Map<String, String> get _jsonHeaders => <String, String>{
+        ...headers,
+        'content-type': 'application/json',
+      };
+
+  static double? _asDouble(Object? value) {
+    if (value is num) {
+      return value.toDouble();
+    }
+    if (value is String) {
+      return double.tryParse(value);
+    }
+    return null;
+  }
+}
+
+class FirestoreGeofireBackend extends RestGeofireBackend {
+  FirestoreGeofireBackend({
+    required String functionBaseUrl,
+    Map<String, String> headers = const <String, String>{},
+    Duration pollInterval = const Duration(seconds: 2),
+  }) : super(
+          baseUrl: functionBaseUrl,
+          headers: headers,
+          pollInterval: pollInterval,
+        );
+}
+
+class SupabaseGeofireBackend extends RestGeofireBackend {
+  SupabaseGeofireBackend({
+    required String edgeFunctionBaseUrl,
+    required String anonKey,
+    Duration pollInterval = const Duration(seconds: 2),
+  }) : super(
+          baseUrl: edgeFunctionBaseUrl,
+          headers: <String, String>{
+            'apikey': anonKey,
+            'authorization': 'Bearer $anonKey',
+          },
+          pollInterval: pollInterval,
+        );
+}
+
+class PostgresGeofireBackend extends RestGeofireBackend {
+  PostgresGeofireBackend({
+    required String apiBaseUrl,
+    Map<String, String> headers = const <String, String>{},
+    Duration pollInterval = const Duration(seconds: 2),
+  }) : super(
+          baseUrl: apiBaseUrl,
+          headers: headers,
+          pollInterval: pollInterval,
+        );
+}
+
+class MysqlGeofireBackend extends RestGeofireBackend {
+  MysqlGeofireBackend({
+    required String apiBaseUrl,
+    Map<String, String> headers = const <String, String>{},
+    Duration pollInterval = const Duration(seconds: 2),
+  }) : super(
+          baseUrl: apiBaseUrl,
+          headers: headers,
+          pollInterval: pollInterval,
+        );
+}
+
+class Geofire {
+  static const onKeyEntered = 'onKeyEntered';
+  static const onGeoQueryReady = 'onGeoQueryReady';
+  static const onKeyMoved = 'onKeyMoved';
+  static const onKeyExited = 'onKeyExited';
+
+  static GeofireBackend _backend = MethodChannelGeofireBackend();
+
+  static void configureBackend(GeofireBackend backend) {
+    _backend = backend;
+  }
+
+  static void useDefaultBackend() {
+    _backend = MethodChannelGeofireBackend();
+  }
+
+  static Future<bool> initialize(String path) {
+    return _backend.initialize(path);
+  }
+
+  static Future<bool?> setLocation(String id, double latitude, double longitude,
+      {Map<String, dynamic>? data}) {
+    return _backend.setLocation(id, latitude, longitude, data: data);
+  }
+
+  static Future<bool?> removeLocation(String id) {
+    return _backend.removeLocation(id);
+  }
+
+  static Future<bool?> stopListener() {
+    return _backend.stopListener();
+  }
+
+  static Future<Map<String, dynamic>> getLocation(String id) {
+    return _backend.getLocation(id);
+  }
+
+  static Stream<dynamic>? queryAtLocation(double lat, double lng, double radius,
+      {bool includeData = false}) {
+    return _backend.queryAtLocation(lat, lng, radius, includeData: includeData);
   }
 
   static Stream<Map<String, dynamic>> queryAtLocationFiltered(

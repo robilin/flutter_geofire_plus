@@ -25,6 +25,53 @@ Example:
 
 ## Usage
 
+### Backend compatibility (Firebase + Firestore + Supabase + Postgres + MySQL)
+
+By default, this package uses Firebase Realtime Database native channels.
+
+You can switch to other backends by configuring a custom adapter before `initialize(...)`:
+
+   Geofire.configureBackend(
+    SupabaseGeofireBackend(
+      edgeFunctionBaseUrl: "https://<project>.functions.supabase.co/geofire",
+      anonKey: "<SUPABASE_ANON_KEY>",
+    ),
+   );
+
+Built-in adapter classes:
+1. `MethodChannelGeofireBackend` (default Firebase Realtime Database behavior)
+2. `FirestoreGeofireBackend` (via your HTTP/Function bridge)
+3. `SupabaseGeofireBackend` (via Supabase Edge Functions)
+4. `PostgresGeofireBackend` (via your API)
+5. `MysqlGeofireBackend` (via your API)
+
+Go backend starter templates are provided in:
+1. `backend_starters/postgres-go`
+2. `backend_starters/mysql-go`
+
+Why bridge APIs are used:
+1. Firestore/Supabase/Postgres/MySQL have different geo-query semantics.
+2. A backend service keeps heavy filtering/ranking off the app and gives consistent realtime event behavior.
+3. Your app code can keep using the same `Geofire.setLocation(...)` and `Geofire.queryAtLocation(...)` APIs.
+
+#### REST endpoint contract for non-default backends
+
+The REST adapters call these endpoints on your backend:
+
+1. `POST /initialize`
+  - body: `{ "path": "drivers_live" }`
+2. `POST /set-location`
+  - body: `{ "path": "drivers_live", "id": "driver1", "lat": -1.28, "lng": 36.81, "data": {...} }`
+3. `POST /remove-location`
+  - body: `{ "path": "drivers_live", "id": "driver1" }`
+4. `GET /get-location?path=drivers_live&id=driver1`
+5. `GET /query?path=drivers_live&lat=-1.28&lng=36.81&radius=5&includeData=true`
+  - response: array of rows like:
+    `[ { "key": "driver1", "latitude": -1.28, "longitude": 36.81, "data": {...} } ]`
+
+The package converts `/query` responses into realtime-style callbacks:
+`onKeyEntered`, `onKeyMoved`, `onKeyExited`, `onGeoQueryReady`.
+
 GeoFire  — Realtime location queries with Firebase.
 
 GeoFire is an open-source library that allows you to store and query a set of keys based on their geographic location.
@@ -253,6 +300,113 @@ For dispatch-focused rider logic, use the candidate stream API (already ranked):
       print(best.distanceKm);
       print(best.data.vehicleType);
     });
+
+### Query from any location/region and render on Google Maps
+
+You can query from any map center, not only the current user location.
+Use the camera target (or a geocoded region center) as query origin, then update markers from realtime events.
+
+Example (`google_maps_flutter`):
+
+```dart
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:flutter_geofire/flutter_geofire.dart';
+
+class DriversMapPage extends StatefulWidget {
+  const DriversMapPage({Key? key}) : super(key: key);
+
+  @override
+  State<DriversMapPage> createState() => _DriversMapPageState();
+}
+
+class _DriversMapPageState extends State<DriversMapPage> {
+  final Map<String, Marker> markersById = <String, Marker>{};
+  StreamSubscription<GeofireDriverEvent>? sub;
+  LatLng currentCenter = const LatLng(-1.286389, 36.817223);
+
+  @override
+  void initState() {
+    super.initState();
+    Geofire.initialize('drivers_live');
+    _startQuery(currentCenter);
+  }
+
+  Future<void> _startQuery(LatLng center) async {
+    await sub?.cancel();
+    await Geofire.stopListener();
+
+    sub = Geofire.queryDriversAtLocationTyped(
+      center.latitude,
+      center.longitude,
+      5,
+      vehicleType: 'bike',
+      region: 'nairobi',
+      isVerified: true,
+      limit: 100,
+    ).listen((event) {
+      switch (event.type) {
+        case GeofireEventType.keyEntered:
+        case GeofireEventType.keyMoved:
+          if (event.latitude == null || event.longitude == null) {
+            return;
+          }
+
+          final marker = Marker(
+            markerId: MarkerId(event.key),
+            position: LatLng(event.latitude!, event.longitude!),
+            infoWindow: InfoWindow(
+              title: event.key,
+              snippet: 'rating: ${event.data.rating ?? '-'}',
+            ),
+          );
+          setState(() {
+            markersById[event.key] = marker;
+          });
+          break;
+
+        case GeofireEventType.keyExited:
+          setState(() {
+            markersById.remove(event.key);
+          });
+          break;
+
+        case GeofireEventType.geoQueryReady:
+        case GeofireEventType.unknown:
+          break;
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    sub?.cancel();
+    Geofire.stopListener();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GoogleMap(
+      initialCameraPosition: CameraPosition(target: currentCenter, zoom: 13),
+      markers: markersById.values.toSet(),
+      onCameraMove: (position) {
+        currentCenter = position.target;
+      },
+      onCameraIdle: () {
+        _startQuery(currentCenter);
+      },
+    );
+  }
+}
+```
+
+Efficiency tips:
+1. Re-query only on `onCameraIdle` (not every frame).
+2. Cancel previous stream before starting a new query.
+3. Keep radius small enough for your city density.
+4. Use filters (`region`, `vehicleType`, `isVerified`) to reduce marker churn.
 
 ### Driver app + rider app reference flow
 
