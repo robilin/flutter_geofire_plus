@@ -1,4 +1,4 @@
-package in.appyflow.geofireexample;
+package co.tz.mianet.geofireexample;
 
 
 import androidx.annotation.NonNull;

@@ -1,11 +1,22 @@
-package in.appyflow.geofire;
+package co.tz.mianet.geofire;
 
+import android.Manifest;
 import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
+import android.location.Location;
+import android.os.Looper;
 import android.util.Log;
 
 
 import androidx.annotation.NonNull;
+import androidx.core.content.ContextCompat;
+
+import com.google.android.gms.location.FusedLocationProviderClient;
+import com.google.android.gms.location.LocationRequest;
+import com.google.android.gms.location.LocationResult;
+import com.google.android.gms.location.LocationServices;
 
 import com.firebase.geofire.GeoFire;
 import com.firebase.geofire.GeoLocation;
@@ -53,6 +64,20 @@ public class GeofirePlugin implements FlutterPlugin,MethodCallHandler, EventChan
     static EventChannel eventChannel;
     private EventChannel.EventSink events;
     private Context applicationContext;
+    private FusedLocationProviderClient fusedLocationClient;
+    private com.google.android.gms.location.LocationCallback nativeLocationCallback;
+    private String nativeTrackingId;
+    private Map<String, Object> nativeTrackingData = new HashMap<>();
+    private long nativeTrackingIntervalMs = 10000L;
+    private float nativeTrackingMinDistanceMeters = 20f;
+    private boolean nativeTrackingIncludeLocationMeta = true;
+    private boolean nativeTrackingRunning = false;
+    private boolean nativeTrackingUseForegroundService = false;
+    private int nativeForegroundNotificationId = 7201;
+    private String nativeForegroundNotificationTitle = "Location tracking active";
+    private String nativeForegroundNotificationBody = "Updating your live location";
+    private String nativeForegroundNotificationChannelId = "geofire_native_tracking";
+    private String nativeForegroundNotificationChannelName = "GeoFire Tracking";
 
     /**
      * Plugin registration.
@@ -188,6 +213,15 @@ public class GeofirePlugin implements FlutterPlugin,MethodCallHandler, EventChan
             final Boolean includeDataArg = call.argument("includeData");
             final boolean includeData = includeDataArg != null && includeDataArg;
             geoFireArea(Double.parseDouble(call.argument("lat").toString()), Double.parseDouble(call.argument("lng").toString()), result, Double.parseDouble(call.argument("radius").toString()), includeData);
+        } else if (call.method.equals("startNativeTracking")) {
+            startNativeTracking(call, result);
+        } else if (call.method.equals("startNativeTrackingDetailed")) {
+            result.success(startNativeTrackingDetailed(call));
+        } else if (call.method.equals("stopNativeTracking")) {
+            stopNativeTracking();
+            result.success(true);
+        } else if (call.method.equals("nativeTrackingStatus")) {
+            result.success(buildNativeTrackingStatus());
         } else if (call.method.equals("stopListener")) {
 
             if (geoQuery != null) {
@@ -373,6 +407,231 @@ public class GeofirePlugin implements FlutterPlugin,MethodCallHandler, EventChan
         void onComplete(boolean isSuccess);
     }
 
+    @SuppressWarnings("unchecked")
+    private void startNativeTracking(MethodCall call, final Result result) {
+        final Map<String, Object> detailed = startNativeTrackingDetailed(call);
+        result.success(Boolean.TRUE.equals(detailed.get("started")));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> startNativeTrackingDetailed(MethodCall call) {
+        if (applicationContext == null) {
+            return buildNativeTrackingStartResponse(false, "context_unavailable", null);
+        }
+        if (geoFire == null) {
+            return buildNativeTrackingStartResponse(false, "not_initialized", null);
+        }
+
+        final String id = call.argument("id");
+        if (id == null || id.trim().isEmpty()) {
+            return buildNativeTrackingStartResponse(false, "invalid_id", null);
+        }
+
+        if (!hasLocationPermission()) {
+            return buildNativeTrackingStartResponse(false, "permission_denied", null);
+        }
+
+        final Number intervalArg = call.argument("intervalMs");
+        final Number minDistanceArg = call.argument("minDistanceMeters");
+        final Boolean includeMetaArg = call.argument("includeLocationMeta");
+        final Boolean useForegroundServiceArg = call.argument("useForegroundService");
+        final Number notificationIdArg = call.argument("foregroundNotificationId");
+        final String notificationTitleArg = call.argument("foregroundNotificationTitle");
+        final String notificationBodyArg = call.argument("foregroundNotificationBody");
+        final String channelIdArg = call.argument("foregroundNotificationChannelId");
+        final String channelNameArg = call.argument("foregroundNotificationChannelName");
+        final Object dataArg = call.argument("data");
+
+        nativeTrackingId = id;
+        nativeTrackingIntervalMs = intervalArg != null ? Math.max(1000L, intervalArg.longValue()) : 10000L;
+        nativeTrackingMinDistanceMeters = minDistanceArg != null ? Math.max(0f, minDistanceArg.floatValue()) : 20f;
+        nativeTrackingIncludeLocationMeta = includeMetaArg == null || includeMetaArg;
+        nativeTrackingUseForegroundService = useForegroundServiceArg != null && useForegroundServiceArg;
+        nativeTrackingData = sanitizeAdditionalData(dataArg);
+
+        if (notificationIdArg != null) {
+            nativeForegroundNotificationId = notificationIdArg.intValue();
+        }
+        if (notificationTitleArg != null && !notificationTitleArg.trim().isEmpty()) {
+            nativeForegroundNotificationTitle = notificationTitleArg;
+        }
+        if (notificationBodyArg != null && !notificationBodyArg.trim().isEmpty()) {
+            nativeForegroundNotificationBody = notificationBodyArg;
+        }
+        if (channelIdArg != null && !channelIdArg.trim().isEmpty()) {
+            nativeForegroundNotificationChannelId = channelIdArg;
+        }
+        if (channelNameArg != null && !channelNameArg.trim().isEmpty()) {
+            nativeForegroundNotificationChannelName = channelNameArg;
+        }
+
+        if (fusedLocationClient == null) {
+            fusedLocationClient = LocationServices.getFusedLocationProviderClient(applicationContext);
+        }
+        if (fusedLocationClient == null) {
+            return buildNativeTrackingStartResponse(false, "location_client_unavailable", null);
+        }
+
+        stopNativeTracking();
+
+        nativeLocationCallback = new com.google.android.gms.location.LocationCallback() {
+            @Override
+            public void onLocationResult(@NonNull LocationResult locationResult) {
+                if (locationResult.getLocations().isEmpty()) {
+                    return;
+                }
+
+                for (Location location : locationResult.getLocations()) {
+                    handleNativeLocationUpdate(location);
+                }
+            }
+        };
+
+        final LocationRequest locationRequest = LocationRequest.create();
+        locationRequest.setPriority(LocationRequest.PRIORITY_HIGH_ACCURACY);
+        locationRequest.setInterval(nativeTrackingIntervalMs);
+        locationRequest.setFastestInterval(Math.max(1000L, nativeTrackingIntervalMs / 2));
+        locationRequest.setSmallestDisplacement(nativeTrackingMinDistanceMeters);
+
+        try {
+            if (nativeTrackingUseForegroundService) {
+                startNativeForegroundService();
+            }
+
+            fusedLocationClient.requestLocationUpdates(
+                    locationRequest,
+                    nativeLocationCallback,
+                    Looper.getMainLooper()
+            );
+            nativeTrackingRunning = true;
+            return buildNativeTrackingStartResponse(true, "started", null);
+        } catch (SecurityException e) {
+            Log.w("GeofirePlugin", "Missing location permission for native tracking", e);
+            nativeTrackingRunning = false;
+            stopNativeForegroundService();
+            return buildNativeTrackingStartResponse(false, "permission_denied", null);
+        } catch (IllegalStateException e) {
+            Log.w("GeofirePlugin", "Foreground service start failed", e);
+            nativeTrackingRunning = false;
+            stopNativeForegroundService();
+            return buildNativeTrackingStartResponse(false, "foreground_service_start_failed", null);
+        } catch (Exception e) {
+            Log.w("GeofirePlugin", "Could not start native tracking", e);
+            nativeTrackingRunning = false;
+            stopNativeForegroundService();
+            return buildNativeTrackingStartResponse(false, "start_failed", null);
+        }
+    }
+
+    private void stopNativeTracking() {
+        if (fusedLocationClient != null && nativeLocationCallback != null) {
+            fusedLocationClient.removeLocationUpdates(nativeLocationCallback);
+        }
+        nativeLocationCallback = null;
+        nativeTrackingRunning = false;
+        stopNativeForegroundService();
+    }
+
+    private Map<String, Object> buildNativeTrackingStatus() {
+        final Map<String, Object> status = new HashMap<>();
+        status.put("isRunning", nativeTrackingRunning);
+        status.put("id", nativeTrackingId);
+        status.put("intervalMs", nativeTrackingIntervalMs);
+        status.put("minDistanceMeters", nativeTrackingMinDistanceMeters);
+        status.put("includeLocationMeta", nativeTrackingIncludeLocationMeta);
+        status.put("useForegroundService", nativeTrackingUseForegroundService);
+        status.put("foregroundNotificationId", nativeForegroundNotificationId);
+        status.put("foregroundNotificationChannelId", nativeForegroundNotificationChannelId);
+        return status;
+    }
+
+    private Map<String, Object> buildNativeTrackingStartResponse(
+            boolean started,
+            String reason,
+            Map<String, Object> details
+    ) {
+        final Map<String, Object> response = new HashMap<>();
+        response.put("started", started);
+        response.put("reason", reason);
+        if (details != null && !details.isEmpty()) {
+            response.put("details", details);
+        }
+        return response;
+    }
+
+    private void startNativeForegroundService() {
+        if (applicationContext == null) {
+            return;
+        }
+
+        final Intent intent = NativeTrackingForegroundService.createIntent(
+                applicationContext,
+                nativeForegroundNotificationId,
+                nativeForegroundNotificationTitle,
+                nativeForegroundNotificationBody,
+                nativeForegroundNotificationChannelId,
+                nativeForegroundNotificationChannelName
+        );
+        ContextCompat.startForegroundService(applicationContext, intent);
+    }
+
+    private void stopNativeForegroundService() {
+        if (applicationContext == null) {
+            return;
+        }
+
+        final Intent intent = new Intent(applicationContext, NativeTrackingForegroundService.class);
+        applicationContext.stopService(intent);
+    }
+
+    private boolean hasLocationPermission() {
+        if (applicationContext == null) {
+            return false;
+        }
+
+        return ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED
+                || ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.ACCESS_COARSE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void handleNativeLocationUpdate(Location location) {
+        if (nativeTrackingId == null || nativeTrackingId.trim().isEmpty()) {
+            return;
+        }
+
+        final Map<String, Object> data = new HashMap<>();
+        if (nativeTrackingData != null && !nativeTrackingData.isEmpty()) {
+            data.putAll(nativeTrackingData);
+        }
+
+        if (nativeTrackingIncludeLocationMeta) {
+            data.put("provider", location.getProvider());
+            data.put("accuracy", location.getAccuracy());
+            data.put("speed", location.getSpeed());
+            data.put("bearing", location.getBearing());
+            data.put("altitude", location.getAltitude());
+            data.put("timestampMs", location.getTime());
+        }
+
+        final Map<String, Object> request = createWriteRequest(
+                nativeTrackingId,
+                location.getLatitude(),
+                location.getLongitude(),
+                data
+        );
+
+        enqueuePendingWrite(request);
+        writeLocationWithData(request, new WriteCompletion() {
+            @Override
+            public void onComplete(boolean isSuccess) {
+                if (isSuccess) {
+                    dequeuePendingWrite(request.get("requestId").toString());
+                }
+            }
+        });
+    }
+
     private Map<String, Object> createWriteRequest(String id, double lat, double lng, Map<String, Object> data) {
         final Map<String, Object> request = new HashMap<>();
         request.put("requestId", UUID.randomUUID().toString());
@@ -544,11 +803,13 @@ public class GeofirePlugin implements FlutterPlugin,MethodCallHandler, EventChan
     @Override
     public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
         applicationContext = binding.getApplicationContext();
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(applicationContext);
         pluginInit(binding.getBinaryMessenger());
     }
 
     @Override
     public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
+        stopNativeTracking();
         applicationContext = null;
         channel.setMethodCallHandler(null);
         eventChannel.setStreamHandler(null);

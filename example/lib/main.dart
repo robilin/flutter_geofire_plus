@@ -44,6 +44,7 @@ class _GeofireDispatchDemoPageState extends State<GeofireDispatchDemoPage> {
 
   bool _initialized = false;
   String _status = 'Initializing...';
+  String _nativeStatus = 'Native tracking idle';
 
   @override
   void initState() {
@@ -154,6 +155,79 @@ class _GeofireDispatchDemoPageState extends State<GeofireDispatchDemoPage> {
     });
   }
 
+  Future<void> _startNativeTracking() async {
+    if (!_initialized) {
+      return;
+    }
+
+    final GeofireNativeTrackingStartResult result =
+        await Geofire.startNativeTrackingDetailed(
+      GeofireNativeTrackingConfig(
+        id: _demoDriverId,
+        intervalMs: 10000,
+        minDistanceMeters: 20,
+        includeLocationMeta: true,
+        allowBackground: true,
+        useForegroundService: true,
+        useSignificantChanges: false,
+        foregroundNotificationTitle: 'GeoFire tracking active',
+        foregroundNotificationBody: 'Sharing live demo location',
+        data: <String, dynamic>{
+          'driverId': _demoDriverId,
+          'vehicleType': 'bike',
+          'region': 'nairobi',
+          'isVerified': true,
+          'rating': 4.8,
+          'activeTrips': 0,
+          'priority': 2,
+          'trackingMode': 'native',
+        },
+      ),
+    );
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _nativeStatus = result.started
+          ? 'Native tracking started'
+          : 'Native start failed: ${result.reason}';
+      _status = 'Native tracking reason: ${result.reason}';
+    });
+
+    await _refreshNativeTrackingStatus();
+  }
+
+  Future<void> _stopNativeTracking() async {
+    final bool? stopped = await Geofire.stopNativeTracking();
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _nativeStatus = stopped == true
+          ? 'Native tracking stopped'
+          : 'Failed to stop native tracking';
+    });
+
+    await _refreshNativeTrackingStatus();
+  }
+
+  Future<void> _refreshNativeTrackingStatus() async {
+    final Map<String, dynamic> status = await Geofire.nativeTrackingStatus();
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _nativeStatus =
+          'running=${status['isRunning']} | id=${status['id'] ?? '-'} | '
+          'interval=${status['intervalMs'] ?? '-'}ms | '
+          'minDistance=${status['minDistanceMeters'] ?? '-'}m';
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final GeofireDriverCandidate? bestCandidate =
@@ -181,6 +255,8 @@ class _GeofireDispatchDemoPageState extends State<GeofireDispatchDemoPage> {
                     const SizedBox(height: 8),
                     Text(_status),
                     const SizedBox(height: 8),
+                    Text(_nativeStatus),
+                    const SizedBox(height: 8),
                     Text('Matched candidates: ${_candidates.length}'),
                   ],
                 ),
@@ -198,6 +274,18 @@ class _GeofireDispatchDemoPageState extends State<GeofireDispatchDemoPage> {
                 ElevatedButton(
                   onPressed: _initialized ? _removeDemoDriverLocation : null,
                   child: const Text('Remove Driver'),
+                ),
+                ElevatedButton(
+                  onPressed: _initialized ? _startNativeTracking : null,
+                  child: const Text('Start Native Tracking'),
+                ),
+                ElevatedButton(
+                  onPressed: _stopNativeTracking,
+                  child: const Text('Stop Native Tracking'),
+                ),
+                OutlinedButton(
+                  onPressed: _refreshNativeTrackingStatus,
+                  child: const Text('Native Status'),
                 ),
                 OutlinedButton(
                   onPressed: _initializeAndStartQuery,

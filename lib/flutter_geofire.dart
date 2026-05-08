@@ -158,6 +158,15 @@ abstract class GeofireBackend {
       {bool includeData = false});
 
   Future<bool?> stopListener();
+
+  Future<bool?> startNativeTracking(Map<String, dynamic> config);
+
+  Future<Map<String, dynamic>> startNativeTrackingDetailed(
+      Map<String, dynamic> config);
+
+  Future<bool?> stopNativeTracking();
+
+  Future<Map<String, dynamic>> nativeTrackingStatus();
 }
 
 class MethodChannelGeofireBackend implements GeofireBackend {
@@ -237,6 +246,42 @@ class MethodChannelGeofireBackend implements GeofireBackend {
   @override
   Future<bool?> stopListener() async {
     return _channel.invokeMethod('stopListener', <String, dynamic>{});
+  }
+
+  @override
+  Future<bool?> startNativeTracking(Map<String, dynamic> config) async {
+    return _channel.invokeMethod('startNativeTracking', config);
+  }
+
+  @override
+  Future<Map<String, dynamic>> startNativeTrackingDetailed(
+      Map<String, dynamic> config) async {
+    final Map<dynamic, dynamic>? response =
+        await _channel.invokeMethod('startNativeTrackingDetailed', config);
+    if (response == null) {
+      return <String, dynamic>{
+        'started': false,
+        'reason': 'unknown',
+      };
+    }
+    return response.map((dynamic key, dynamic value) =>
+        MapEntry<String, dynamic>(key.toString(), value));
+  }
+
+  @override
+  Future<bool?> stopNativeTracking() async {
+    return _channel.invokeMethod('stopNativeTracking', <String, dynamic>{});
+  }
+
+  @override
+  Future<Map<String, dynamic>> nativeTrackingStatus() async {
+    final Map<dynamic, dynamic>? response =
+        await _channel.invokeMethod('nativeTrackingStatus');
+    if (response == null) {
+      return <String, dynamic>{};
+    }
+    return response.map((dynamic key, dynamic value) =>
+        MapEntry<String, dynamic>(key.toString(), value));
   }
 }
 
@@ -371,6 +416,33 @@ class RestGeofireBackend implements GeofireBackend {
       'result': <String>[],
     });
     return true;
+  }
+
+  @override
+  Future<bool?> startNativeTracking(Map<String, dynamic> config) async {
+    return false;
+  }
+
+  @override
+  Future<Map<String, dynamic>> startNativeTrackingDetailed(
+      Map<String, dynamic> config) async {
+    return <String, dynamic>{
+      'started': false,
+      'reason': 'unsupported_backend',
+    };
+  }
+
+  @override
+  Future<bool?> stopNativeTracking() async {
+    return false;
+  }
+
+  @override
+  Future<Map<String, dynamic>> nativeTrackingStatus() async {
+    return <String, dynamic>{
+      'isRunning': false,
+      'error': 'Native tracking is only available on MethodChannel backend',
+    };
   }
 
   Future<void> _pollQuery() async {
@@ -541,6 +613,83 @@ class MysqlGeofireBackend extends RestGeofireBackend {
         );
 }
 
+class GeofireNativeTrackingConfig {
+  GeofireNativeTrackingConfig({
+    required this.id,
+    this.intervalMs = 10000,
+    this.minDistanceMeters = 20,
+    this.includeLocationMeta = true,
+    this.allowBackground = false,
+    this.useForegroundService = false,
+    this.useSignificantChanges = false,
+    this.foregroundNotificationTitle,
+    this.foregroundNotificationBody,
+    this.foregroundNotificationChannelId,
+    this.foregroundNotificationChannelName,
+    this.foregroundNotificationId,
+    this.data,
+  });
+
+  final String id;
+  final int intervalMs;
+  final double minDistanceMeters;
+  final bool includeLocationMeta;
+  final bool allowBackground;
+  final bool useForegroundService;
+  final bool useSignificantChanges;
+  final String? foregroundNotificationTitle;
+  final String? foregroundNotificationBody;
+  final String? foregroundNotificationChannelId;
+  final String? foregroundNotificationChannelName;
+  final int? foregroundNotificationId;
+  final Map<String, dynamic>? data;
+
+  Map<String, dynamic> toMap() {
+    return <String, dynamic>{
+      'id': id,
+      'intervalMs': intervalMs,
+      'minDistanceMeters': minDistanceMeters,
+      'includeLocationMeta': includeLocationMeta,
+      'allowBackground': allowBackground,
+      'useForegroundService': useForegroundService,
+      'useSignificantChanges': useSignificantChanges,
+      if (foregroundNotificationTitle != null)
+        'foregroundNotificationTitle': foregroundNotificationTitle,
+      if (foregroundNotificationBody != null)
+        'foregroundNotificationBody': foregroundNotificationBody,
+      if (foregroundNotificationChannelId != null)
+        'foregroundNotificationChannelId': foregroundNotificationChannelId,
+      if (foregroundNotificationChannelName != null)
+        'foregroundNotificationChannelName': foregroundNotificationChannelName,
+      if (foregroundNotificationId != null)
+        'foregroundNotificationId': foregroundNotificationId,
+      if (data != null && data!.isNotEmpty) 'data': data,
+    };
+  }
+}
+
+class GeofireNativeTrackingStartResult {
+  GeofireNativeTrackingStartResult({
+    required this.started,
+    required this.reason,
+    this.details,
+  });
+
+  final bool started;
+  final String reason;
+  final Map<String, dynamic>? details;
+
+  factory GeofireNativeTrackingStartResult.fromMap(Map<String, dynamic> map) {
+    return GeofireNativeTrackingStartResult(
+      started: map['started'] == true,
+      reason: (map['reason'] ?? 'unknown').toString(),
+      details: map['details'] is Map
+          ? Map<String, dynamic>.from(map['details'] as Map)
+          : null,
+    );
+  }
+}
+
 class Geofire {
   static const onKeyEntered = 'onKeyEntered';
   static const onGeoQueryReady = 'onGeoQueryReady';
@@ -572,6 +721,25 @@ class Geofire {
 
   static Future<bool?> stopListener() {
     return _backend.stopListener();
+  }
+
+  static Future<bool?> startNativeTracking(GeofireNativeTrackingConfig config) {
+    return _backend.startNativeTracking(config.toMap());
+  }
+
+  static Future<GeofireNativeTrackingStartResult> startNativeTrackingDetailed(
+      GeofireNativeTrackingConfig config) async {
+    final Map<String, dynamic> response =
+        await _backend.startNativeTrackingDetailed(config.toMap());
+    return GeofireNativeTrackingStartResult.fromMap(response);
+  }
+
+  static Future<bool?> stopNativeTracking() {
+    return _backend.stopNativeTracking();
+  }
+
+  static Future<Map<String, dynamic>> nativeTrackingStatus() {
+    return _backend.nativeTrackingStatus();
   }
 
   static Future<Map<String, dynamic>> getLocation(String id) {

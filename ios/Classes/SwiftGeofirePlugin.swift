@@ -1,10 +1,11 @@
 import Flutter
 import UIKit
+import CoreLocation
 import GeoFire
 import FirebaseDatabase
 
 
-public class SwiftGeofirePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
+public class SwiftGeofirePlugin: NSObject, FlutterPlugin, FlutterStreamHandler, CLLocationManagerDelegate {
     static let pendingWritesKey = "flutter_geofire_pending_writes"
     static var persistenceConfigured = false
 
@@ -13,6 +14,16 @@ public class SwiftGeofirePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     var geoFire:GeoFire?
     private var eventSink: FlutterEventSink?
     var circleQuery : GFCircleQuery?
+    private var locationManager: CLLocationManager?
+    private var nativeTrackingId: String?
+    private var nativeTrackingData: [String: Any] = [:]
+    private var nativeTrackingDistance: CLLocationDistance = 20
+    private var nativeTrackingIntervalMs: Double = 10000
+    private var nativeTrackingIncludeLocationMeta = true
+    private var nativeTrackingRunning = false
+    private var nativeTrackingAllowBackground = false
+    private var nativeTrackingUseSignificantChanges = false
+    private var nativeLastPushAtMs: Double = 0
 
     
   public static func register(with registrar: FlutterPluginRegistrar) {
@@ -115,6 +126,24 @@ public class SwiftGeofirePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         result(true);
         
     }
+
+    else if(call.method.elementsEqual("startNativeTracking")){
+        let response = startNativeTrackingDetailed(arguments: arguements)
+        result(response["started"] as? Bool ?? false)
+    }
+
+    else if(call.method.elementsEqual("startNativeTrackingDetailed")){
+        result(startNativeTrackingDetailed(arguments: arguements))
+    }
+
+    else if(call.method.elementsEqual("stopNativeTracking")){
+        stopNativeTracking()
+        result(true)
+    }
+
+    else if(call.method.elementsEqual("nativeTrackingStatus")){
+        result(nativeTrackingStatus())
+    }
     
     else if(call.method.elementsEqual("getLocation")){
         
@@ -194,6 +223,149 @@ public class SwiftGeofirePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     }
     
   }
+
+    private func startNativeTrackingDetailed(arguments: NSDictionary?) -> [String: Any] {
+        guard CLLocationManager.locationServicesEnabled() else {
+            return buildNativeTrackingStartResponse(started: false, reason: "location_services_disabled")
+        }
+
+        guard geoFire != nil else {
+            return buildNativeTrackingStartResponse(started: false, reason: "not_initialized")
+        }
+
+        guard let id = arguments?["id"] as? String, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return buildNativeTrackingStartResponse(started: false, reason: "invalid_id")
+        }
+
+        nativeTrackingId = id
+        nativeTrackingIntervalMs = max(1000, (arguments?["intervalMs"] as? NSNumber)?.doubleValue ?? 10000)
+        nativeTrackingDistance = max(0, (arguments?["minDistanceMeters"] as? NSNumber)?.doubleValue ?? 20)
+        nativeTrackingIncludeLocationMeta = arguments?["includeLocationMeta"] as? Bool ?? true
+        nativeTrackingAllowBackground = arguments?["allowBackground"] as? Bool ?? false
+        nativeTrackingUseSignificantChanges = arguments?["useSignificantChanges"] as? Bool ?? false
+        nativeLastPushAtMs = 0
+        nativeTrackingData = Dictionary(uniqueKeysWithValues: sanitizeAdditionalData(arguments?["data"] as? [String: Any] ?? [:]).map {
+            (String(describing: $0.key), $0.value)
+        })
+
+        if locationManager == nil {
+            locationManager = CLLocationManager()
+            locationManager?.delegate = self
+        }
+
+        guard let manager = locationManager else {
+            return buildNativeTrackingStartResponse(started: false, reason: "location_manager_unavailable")
+        }
+
+        stopNativeTracking()
+
+        manager.desiredAccuracy = kCLLocationAccuracyBest
+        manager.distanceFilter = nativeTrackingDistance
+        manager.pausesLocationUpdatesAutomatically = false
+
+        if #available(iOS 9.0, *) {
+            manager.allowsBackgroundLocationUpdates = nativeTrackingAllowBackground
+        }
+
+        switch CLLocationManager.authorizationStatus() {
+        case .notDetermined:
+            if nativeTrackingAllowBackground {
+                manager.requestAlwaysAuthorization()
+            } else {
+                manager.requestWhenInUseAuthorization()
+            }
+            return buildNativeTrackingStartResponse(started: false, reason: "authorization_request_initiated")
+        case .restricted, .denied:
+            return buildNativeTrackingStartResponse(started: false, reason: "permission_denied")
+        case .authorizedAlways, .authorizedWhenInUse:
+            if nativeTrackingUseSignificantChanges {
+                manager.startMonitoringSignificantLocationChanges()
+            } else {
+                manager.startUpdatingLocation()
+            }
+            nativeTrackingRunning = true
+            return buildNativeTrackingStartResponse(started: true, reason: "started")
+        @unknown default:
+            return buildNativeTrackingStartResponse(started: false, reason: "authorization_unknown")
+        }
+    }
+
+    private func stopNativeTracking() {
+        if nativeTrackingUseSignificantChanges {
+            locationManager?.stopMonitoringSignificantLocationChanges()
+        }
+        locationManager?.stopUpdatingLocation()
+        nativeLastPushAtMs = 0
+        nativeTrackingRunning = false
+    }
+
+    private func nativeTrackingStatus() -> [String: Any] {
+        return [
+            "isRunning": nativeTrackingRunning,
+            "id": nativeTrackingId as Any,
+            "intervalMs": nativeTrackingIntervalMs,
+            "minDistanceMeters": nativeTrackingDistance,
+            "includeLocationMeta": nativeTrackingIncludeLocationMeta,
+            "allowBackground": nativeTrackingAllowBackground,
+            "useSignificantChanges": nativeTrackingUseSignificantChanges,
+        ]
+    }
+
+    private func buildNativeTrackingStartResponse(started: Bool, reason: String) -> [String: Any] {
+        return [
+            "started": started,
+            "reason": reason,
+        ]
+    }
+
+    public func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard nativeTrackingRunning else {
+            return
+        }
+
+        for location in locations {
+            handleNativeLocationUpdate(location)
+        }
+    }
+
+    public func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        print("Native tracking location error: \(error.localizedDescription)")
+    }
+
+    private func handleNativeLocationUpdate(_ location: CLLocation) {
+        guard let id = nativeTrackingId else {
+            return
+        }
+
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        if nativeLastPushAtMs > 0 && (nowMs - nativeLastPushAtMs) < nativeTrackingIntervalMs {
+            return
+        }
+        nativeLastPushAtMs = nowMs
+
+        var data = nativeTrackingData
+        if nativeTrackingIncludeLocationMeta {
+            data["accuracy"] = location.horizontalAccuracy
+            data["speed"] = location.speed
+            data["heading"] = location.course
+            data["altitude"] = location.altitude
+            data["timestampMs"] = Int(location.timestamp.timeIntervalSince1970 * 1000)
+        }
+
+        let request = createWriteRequest(
+            id: id,
+            lat: location.coordinate.latitude,
+            lng: location.coordinate.longitude,
+            data: data
+        )
+
+        enqueuePendingWrite(request)
+        writeLocationWithData(request) { isSuccess in
+            if isSuccess, let requestId = request["requestId"] as? String {
+                self.dequeuePendingWrite(requestId)
+            }
+        }
+    }
 
 
    public func onListen(withArguments arguments: Any?,
