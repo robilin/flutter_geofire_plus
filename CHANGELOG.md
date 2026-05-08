@@ -1,0 +1,63 @@
+## 2.0.7
+
+* Android and iOS latest versions
+
+## 2.0.6
+
+* Android issue fixed
+
+## 2.0.5
+
+* iOS latest compatibility
+
+## 2.0.4
+
+* Android latest compatibility
+
+## 2.0.3
+
+* iOS Dependency issue fixed: Check example app pod file
+* Bug fixes
+
+## 2.0.2
+
+* Bug fixes
+
+## 2.0.1
+
+* Android V2 support added
+* Bug fixes
+
+## 2.0.0
+
+* Added Null Safety
+* Upgraded GeoFire Dependency in Android and iOS
+
+## 1.0.3
+
+* Swift 5.1 Support Added + Firebase Support Files Problem Solved
+
+## 1.0.0
+
+* Remove Query Listeners Feature added
+
+## 0.0.5
+
+* Stream added for query with all callbacks.
+
+## 0.0.4
+
+* Implementation
+
+## 0.0.3
+
+* Implementation
+
+## 0.0.2
+
+* Implementation
+
+
+## 0.0.1
+
+* TODO: Describe initial release.

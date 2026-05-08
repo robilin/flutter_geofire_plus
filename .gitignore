@@ -1,0 +1,12 @@
+.DS_Store
+.dart_tool/
+
+.packages
+.pub/
+pubspec.lock
+
+.idea/
+
+build/
+example/android/app/google-services.json
+example/ios/Runner/GoogleService-Info.plist
