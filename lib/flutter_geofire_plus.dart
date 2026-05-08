@@ -746,7 +746,7 @@ class Geofire {
     return _backend.getLocation(id);
   }
 
-  static Stream<dynamic>? queryAtLocation(double lat, double lng, double radius,
+  static Stream<dynamic> queryAtLocation(double lat, double lng, double radius,
       {bool includeData = false}) {
     return _backend.queryAtLocation(lat, lng, radius, includeData: includeData);
   }
@@ -770,9 +770,8 @@ class Geofire {
       GeofireScoreBuilder? scoreBy,
       int? limit}) async* {
     final Stream<dynamic> source = queryAtLocation(lat, lng, radius,
-            includeData: _requiresData(
-                equalsData: equalsData, minData: minData, maxData: maxData)) ??
-        const Stream<dynamic>.empty();
+        includeData: _requiresData(
+            equalsData: equalsData, minData: minData, maxData: maxData));
 
     final Set<String> matchedKeys = <String>{};
     final Map<String, double> scoreByKey = <String, double>{};
@@ -896,12 +895,12 @@ class Geofire {
           (event['longitude'] as num?)?.toDouble() ?? riderLng,
         );
 
-        final double rating = (data['rating'] as num?)?.toDouble() ?? 0.0;
-        final double priority = (data['priority'] as num?)?.toDouble() ?? 0.0;
-        final double activeTrips =
-            (data['activeTrips'] as num?)?.toDouble() ?? 0.0;
-
-        return (priority * 2.0) + rating - (distanceKm * 1.5) - activeTrips;
+        return _defaultDispatchScore(
+          distanceKm,
+          (data['rating'] as num?)?.toDouble() ?? 0.0,
+          (data['priority'] as num?)?.toDouble() ?? 0.0,
+          (data['activeTrips'] as num?)?.toDouble() ?? 0.0,
+        );
       },
     );
   }
@@ -1116,12 +1115,444 @@ class Geofire {
     final double distanceKm =
         _distanceKm(riderLat, riderLng, latitude, longitude);
 
-    final double rating = event.data.rating ?? 0.0;
-    final double priority = event.data.priority ?? 0.0;
-    final double activeTrips = (event.data.activeTrips ?? 0).toDouble();
+    return _defaultDispatchScore(
+      distanceKm,
+      event.data.rating ?? 0.0,
+      event.data.priority ?? 0.0,
+      (event.data.activeTrips ?? 0).toDouble(),
+    );
+  }
 
+  static double _defaultDispatchScore(
+      double distanceKm, double rating, double priority, double activeTrips) {
     return (priority * 2.0) + rating - (distanceKm * 1.5) - activeTrips;
   }
 
   static double _toRadians(double degree) => degree * 0.017453292519943295;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Shared private helper — Haversine distance used by all AI features below.
+// ──────────────────────────────────────────────────────────────────────────────
+
+double _haversineKm(double lat1, double lng1, double lat2, double lng2) {
+  const double r = 6371.0;
+  final double dLat = (lat2 - lat1) * math.pi / 180.0;
+  final double dLng = (lng2 - lng1) * math.pi / 180.0;
+  final double lat1R = lat1 * math.pi / 180.0;
+  final double lat2R = lat2 * math.pi / 180.0;
+  final double sinLat = math.sin(dLat / 2);
+  final double sinLng = math.sin(dLng / 2);
+  final double a =
+      sinLat * sinLat + math.cos(lat1R) * math.cos(lat2R) * sinLng * sinLng;
+  return r * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a));
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// AI Feature 1 — Kalman Filter (GPS smoothing + velocity + ETA)
+// Pure Dart, runs entirely on-device, no external service.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Internal 1-D Kalman filter tracking position + velocity for one axis.
+class _KalmanAxis {
+  _KalmanAxis({
+    required double initialPosition,
+    double processNoiseQ = 0.5,
+    double measurementNoiseR = 10.0,
+  })  : _pos = initialPosition,
+        _vel = 0.0,
+        _pPos = measurementNoiseR,
+        _pVel = 1.0,
+        _pCross = 0.0,
+        _q = processNoiseQ,
+        _r = measurementNoiseR;
+
+  double _pos;
+  double _vel;
+  double _pPos;
+  double _pVel;
+  double _pCross;
+  final double _q;
+  final double _r;
+
+  void update(double measurement, double dt) {
+    if (dt <= 0) return;
+
+    // Predict
+    final double pPosPred =
+        _pPos + dt * (_pCross + _pCross) + dt * dt * _pVel + _q;
+    final double pCrossPred = _pCross + dt * _pVel;
+    final double pVelPred = _pVel + _q * 0.1;
+    final double posPred = _pos + _vel * dt;
+
+    // Update (only position is measured)
+    final double s = pPosPred + _r;
+    final double kPos = pPosPred / s;
+    final double kVel = pCrossPred / s;
+    final double innovation = measurement - posPred;
+
+    _pos = posPred + kPos * innovation;
+    _vel = _vel + kVel * innovation;
+    _pPos = (1.0 - kPos) * pPosPred;
+    _pCross = pCrossPred - kPos * pPosPred;
+    _pVel = pVelPred - kVel * pCrossPred;
+  }
+
+  double get position => _pos;
+  double get velocity => _vel; // degrees per second
+}
+
+/// A smoothed GPS position produced by [GeofireKalmanFilter].
+class GeofireSmoothedPosition {
+  GeofireSmoothedPosition({
+    required this.latitude,
+    required this.longitude,
+    required this.velocityLatKmh,
+    required this.velocityLngKmh,
+    required this.speedKmh,
+  });
+
+  final double latitude;
+  final double longitude;
+
+  /// North-component of velocity in km/h (positive = northward).
+  final double velocityLatKmh;
+
+  /// East-component of velocity in km/h (positive = eastward).
+  final double velocityLngKmh;
+
+  /// Scalar speed in km/h derived from both components.
+  final double speedKmh;
+
+  /// Extrapolates this position [secondsAhead] seconds into the future
+  /// using current velocity. Useful for predictive UI or ETA display.
+  GeofireSmoothedPosition predict(double secondsAhead) {
+    const double kmPerDegreeLat = 111.32;
+    final double kmPerDegreeLng = 111.32 * math.cos(latitude * math.pi / 180.0);
+    final double deltaLat =
+        (velocityLatKmh / 3600.0) * secondsAhead / kmPerDegreeLat;
+    final double deltaLng =
+        (velocityLngKmh / 3600.0) * secondsAhead / kmPerDegreeLng;
+    return GeofireSmoothedPosition(
+      latitude: latitude + deltaLat,
+      longitude: longitude + deltaLng,
+      velocityLatKmh: velocityLatKmh,
+      velocityLngKmh: velocityLngKmh,
+      speedKmh: speedKmh,
+    );
+  }
+}
+
+/// On-device Kalman filter that smooths noisy GPS readings and tracks velocity.
+///
+/// No external service is used. All math runs in Dart on the device.
+///
+/// Each driver should have its own [GeofireKalmanFilter] instance.
+///
+/// ```dart
+/// final filters = <String, GeofireKalmanFilter>{};
+///
+/// Geofire.queryAtLocation(lat, lng, radius, includeData: true).listen((event) {
+///   final key   = event['key'] as String;
+///   final dLat  = (event['latitude']  as num).toDouble();
+///   final dLng  = (event['longitude'] as num).toDouble();
+///
+///   final filter  = filters.putIfAbsent(key, () => GeofireKalmanFilter());
+///   final smoothed = filter.update(dLat, dLng);
+///
+///   print('Speed: ${smoothed.speedKmh.toStringAsFixed(1)} km/h');
+///   print('ETA  : ${filter.estimateEtaSeconds(dLat, dLng, riderLat, riderLng)}s');
+/// });
+/// ```
+class GeofireKalmanFilter {
+  GeofireKalmanFilter({
+    /// Higher value = trusts new measurements more (noisier but responsive).
+    double processNoise = 0.5,
+
+    /// GPS horizontal accuracy in metres (lower = smoother but more lag).
+    double measurementNoise = 10.0,
+  })  : _processNoise = processNoise,
+        _measurementNoise = measurementNoise;
+
+  final double _processNoise;
+  final double _measurementNoise;
+
+  _KalmanAxis? _latAxis;
+  _KalmanAxis? _lngAxis;
+  int? _lastTimestampMs;
+
+  /// Feed a raw GPS reading. Returns the smoothed position and estimated velocity.
+  ///
+  /// [timestampMs] defaults to [DateTime.now().millisecondsSinceEpoch].
+  GeofireSmoothedPosition update(double lat, double lng, {int? timestampMs}) {
+    final int nowMs = timestampMs ?? DateTime.now().millisecondsSinceEpoch;
+
+    if (_latAxis == null || _lngAxis == null) {
+      _latAxis = _KalmanAxis(
+        initialPosition: lat,
+        processNoiseQ: _processNoise,
+        measurementNoiseR: _measurementNoise,
+      );
+      _lngAxis = _KalmanAxis(
+        initialPosition: lng,
+        processNoiseQ: _processNoise,
+        measurementNoiseR: _measurementNoise,
+      );
+      _lastTimestampMs = nowMs;
+    } else {
+      final double dt = (nowMs - (_lastTimestampMs ?? nowMs)) / 1000.0;
+      _latAxis!.update(lat, dt);
+      _lngAxis!.update(lng, dt);
+      _lastTimestampMs = nowMs;
+    }
+
+    const double kmPerDegreeLat = 111.32;
+    final double smoothedLat = _latAxis!.position;
+    final double kmPerDegreeLng =
+        111.32 * math.cos(smoothedLat * math.pi / 180.0);
+
+    final double velLatKmh = _latAxis!.velocity * kmPerDegreeLat * 3600.0;
+    final double velLngKmh = _lngAxis!.velocity * kmPerDegreeLng * 3600.0;
+    final double speedKmh =
+        math.sqrt(velLatKmh * velLatKmh + velLngKmh * velLngKmh);
+
+    return GeofireSmoothedPosition(
+      latitude: smoothedLat,
+      longitude: _lngAxis!.position,
+      velocityLatKmh: velLatKmh,
+      velocityLngKmh: velLngKmh,
+      speedKmh: speedKmh,
+    );
+  }
+
+  /// Estimates ETA in seconds for a driver at [driverLat/Lng] to reach
+  /// [targetLat/Lng] using the Kalman-estimated speed and straight-line distance.
+  ///
+  /// Returns `null` if the filter has not been initialised yet or the driver
+  /// appears stationary (speed < 0.5 km/h).
+  double? estimateEtaSeconds(
+    double driverLat,
+    double driverLng,
+    double targetLat,
+    double targetLng,
+  ) {
+    if (_latAxis == null || _lngAxis == null) return null;
+
+    const double kmPerDegreeLat = 111.32;
+    final double kmPerDegreeLng =
+        111.32 * math.cos(driverLat * math.pi / 180.0);
+    final double velLatKmh = _latAxis!.velocity * kmPerDegreeLat * 3600.0;
+    final double velLngKmh = _lngAxis!.velocity * kmPerDegreeLng * 3600.0;
+    final double speedKmh =
+        math.sqrt(velLatKmh * velLatKmh + velLngKmh * velLngKmh);
+
+    if (speedKmh < 0.5) return null;
+
+    final double distKm =
+        _haversineKm(driverLat, driverLng, targetLat, targetLng);
+    return (distKm / speedKmh) * 3600.0;
+  }
+
+  /// Resets all filter state (e.g. when a driver goes offline then reconnects).
+  void reset() {
+    _latAxis = null;
+    _lngAxis = null;
+    _lastTimestampMs = null;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// AI Feature 2 — Velocity Guard (GPS spoof / impossible-jump detection)
+// Pure Dart, runs entirely on-device, no external service.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Result of a [GeofireVelocityGuard.check] call.
+class GeofireAnomalyResult {
+  GeofireAnomalyResult({
+    required this.key,
+    required this.isSuspicious,
+    required this.speedKmh,
+    this.reason,
+  });
+
+  /// The driver key that was checked.
+  final String key;
+
+  /// `true` when the location jump is physically impossible given [maxSpeedKmh].
+  final bool isSuspicious;
+
+  /// Computed speed in km/h between the previous and current reading.
+  final double speedKmh;
+
+  /// Human-readable reason when [isSuspicious] is `true`.
+  final String? reason;
+}
+
+class _DriverSnapshot {
+  _DriverSnapshot(this.lat, this.lng, this.timestampMs);
+  final double lat;
+  final double lng;
+  final int timestampMs;
+}
+
+/// Detects physically impossible GPS position jumps per driver.
+///
+/// Works entirely on-device — pure Dart math. No AI service needed.
+///
+/// ```dart
+/// final guard = GeofireVelocityGuard(maxSpeedKmh: 180);
+///
+/// stream.listen((event) {
+///   final result = guard.check(event['key'], lat, lng);
+///   if (result.isSuspicious) {
+///     print('Possible spoof: ${result.reason}');
+///   } else {
+///     // trust the location
+///   }
+/// });
+/// ```
+class GeofireVelocityGuard {
+  GeofireVelocityGuard({
+    /// Maximum physically plausible speed for your vehicle type.
+    /// Cars: 180–220, motorcycles: 200, walking: 10.
+    this.maxSpeedKmh = 200.0,
+  });
+
+  final double maxSpeedKmh;
+  final Map<String, _DriverSnapshot> _snapshots = <String, _DriverSnapshot>{};
+
+  /// Checks whether the new [lat/lng] for [key] is reachable from the previous
+  /// reading within [maxSpeedKmh]. The first call for a key always returns
+  /// `isSuspicious: false` (no baseline to compare against yet).
+  GeofireAnomalyResult check(String key, double lat, double lng,
+      {int? timestampMs}) {
+    final int nowMs = timestampMs ?? DateTime.now().millisecondsSinceEpoch;
+    final _DriverSnapshot? prev = _snapshots[key];
+
+    if (prev == null) {
+      _snapshots[key] = _DriverSnapshot(lat, lng, nowMs);
+      return GeofireAnomalyResult(key: key, isSuspicious: false, speedKmh: 0.0);
+    }
+
+    final double dtHours = (nowMs - prev.timestampMs) / 3600000.0;
+    if (dtHours <= 0) {
+      return GeofireAnomalyResult(key: key, isSuspicious: false, speedKmh: 0.0);
+    }
+
+    final double distKm = _haversineKm(prev.lat, prev.lng, lat, lng);
+    final double speedKmh = distKm / dtHours;
+
+    _snapshots[key] = _DriverSnapshot(lat, lng, nowMs);
+
+    if (speedKmh > maxSpeedKmh) {
+      return GeofireAnomalyResult(
+        key: key,
+        isSuspicious: true,
+        speedKmh: speedKmh,
+        reason:
+            'Speed ${speedKmh.toStringAsFixed(1)} km/h exceeds limit of $maxSpeedKmh km/h',
+      );
+    }
+
+    return GeofireAnomalyResult(
+        key: key, isSuspicious: false, speedKmh: speedKmh);
+  }
+
+  /// Call when a driver goes offline so their baseline is cleared.
+  void remove(String key) => _snapshots.remove(key);
+
+  /// Clears all stored baselines.
+  void clear() => _snapshots.clear();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// AI Feature 3 — Spatial Cluster (dedup bunched drivers)
+// Pure Dart greedy radius clustering, no external service.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A cluster of spatially close [GeofireDriverCandidate]s.
+class GeofireCluster {
+  GeofireCluster({
+    required this.centroidLat,
+    required this.centroidLng,
+    required this.candidates,
+    required this.bestCandidate,
+  });
+
+  final double centroidLat;
+  final double centroidLng;
+
+  /// All candidates that fell within [GeoFireSpatialCluster.clusterRadiusKm]
+  /// of the seed.
+  final List<GeofireDriverCandidate> candidates;
+
+  /// The candidate with the highest score inside this cluster.
+  final GeofireDriverCandidate bestCandidate;
+
+  int get size => candidates.length;
+}
+
+/// Groups a flat list of [GeofireDriverCandidate]s into spatial clusters so
+/// that bunched drivers in the same block appear as one entry.
+///
+/// Uses greedy radius-based grouping — O(n²) but fast for typical
+/// driver counts (< 200). Pure Dart, no external service.
+///
+/// ```dart
+/// final candidates = ...; // from queryDriverCandidatesAtLocation
+/// final clusters = GeoFireSpatialCluster.cluster(candidates);
+/// final topPerCluster = clusters.map((c) => c.bestCandidate).toList();
+/// ```
+class GeoFireSpatialCluster {
+  /// Groups [candidates] into clusters where every member is within
+  /// [clusterRadiusKm] kilometres of the seed (highest-score candidate first).
+  static List<GeofireCluster> cluster(
+    List<GeofireDriverCandidate> candidates, {
+    double clusterRadiusKm = 0.5,
+  }) {
+    // Sort descending by score so the highest-score driver seeds each cluster.
+    final List<GeofireDriverCandidate> remaining =
+        List<GeofireDriverCandidate>.from(candidates)
+          ..sort((GeofireDriverCandidate a, GeofireDriverCandidate b) =>
+              b.score.compareTo(a.score));
+
+    final List<GeofireCluster> clusters = <GeofireCluster>[];
+
+    while (remaining.isNotEmpty) {
+      final GeofireDriverCandidate seed = remaining.removeAt(0);
+      final List<GeofireDriverCandidate> group = <GeofireDriverCandidate>[seed];
+
+      remaining.removeWhere((GeofireDriverCandidate c) {
+        final double d = _haversineKm(
+            seed.latitude, seed.longitude, c.latitude, c.longitude);
+        if (d <= clusterRadiusKm) {
+          group.add(c);
+          return true;
+        }
+        return false;
+      });
+
+      final double centLat = group
+              .map((GeofireDriverCandidate c) => c.latitude)
+              .reduce((double a, double b) => a + b) /
+          group.length;
+      final double centLng = group
+              .map((GeofireDriverCandidate c) => c.longitude)
+              .reduce((double a, double b) => a + b) /
+          group.length;
+
+      final GeofireDriverCandidate best = group.reduce(
+          (GeofireDriverCandidate a, GeofireDriverCandidate b) =>
+              a.score >= b.score ? a : b);
+
+      clusters.add(GeofireCluster(
+        centroidLat: centLat,
+        centroidLng: centLng,
+        candidates: group,
+        bestCandidate: best,
+      ));
+    }
+
+    return clusters;
+  }
 }

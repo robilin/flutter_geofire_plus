@@ -38,16 +38,44 @@ target 'Runner' do
 end
 ```
 
+Add the following keys to your `ios/Runner/Info.plist`:
+
+```xml
+<key>NSLocationWhenInUseUsageDescription</key>
+<string>This app uses your location to show nearby drivers.</string>
+<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+<string>This app uses your location in the background to keep your position up to date.</string>
+<key>UIBackgroundModes</key>
+<array>
+  <string>location</string>
+</array>
+```
+
 Notes:
 1. Works with Swift and Objective-C host apps.
 2. The plugin implementation is Swift with Objective-C bridge compatibility.
 3. No custom GeoFire git fork is required.
+4. Both `NSLocationWhenInUseUsageDescription` and `NSLocationAlwaysAndWhenInUseUsageDescription` are required for background tracking. Omitting either causes silent failures on iOS 13+.
 
 ## Android setup
 
 No extra manual plugin registration is needed.
 
-If you use native location tracking, request runtime location permissions in your app.
+If you use native location tracking, add the required permissions to your `android/app/src/main/AndroidManifest.xml`:
+
+```xml
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+<!-- Required for background tracking (Android 10+) -->
+<uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+<!-- Required when useForegroundService is true -->
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+```
+
+You must also request `ACCESS_FINE_LOCATION` (and `ACCESS_BACKGROUND_LOCATION` for background) at runtime before calling `startNativeTracking`. The plugin does not request permissions automatically.
 
 ## Quickstart (Firebase default backend)
 
@@ -528,14 +556,171 @@ It demonstrates:
 5. Android background unstable:
 - Enable useForegroundService and confirm notification/service permissions on device OS.
 
-## pub.dev release checklist
+## On-Device AI Features
 
-1. Bump version in pubspec.yaml.
-2. Update CHANGELOG.md.
-3. Run flutter analyze.
-4. Run flutter test.
-5. Run flutter pub publish --dry-run.
-6. Publish with flutter pub publish.
+All AI features run entirely in Dart on the device. No external service, API key, or internet connection is required. They are fully opt-in and backward compatible — existing code is unaffected.
+
+---
+
+### GeofireKalmanFilter — GPS smoothing, velocity & ETA
+
+Applies a Kalman filter to raw GPS readings per driver to remove noise, estimate speed, and predict future position or arrival time.
+
+```dart
+// One filter instance per driver.
+final filters = <String, GeofireKalmanFilter>{};
+
+Geofire.queryAtLocation(riderLat, riderLng, 5.0, includeData: true).listen((event) {
+  final key  = event['key'] as String;
+  final dLat = (event['latitude']  as num).toDouble();
+  final dLng = (event['longitude'] as num).toDouble();
+
+  final filter   = filters.putIfAbsent(key, () => GeofireKalmanFilter());
+  final smoothed = filter.update(dLat, dLng);
+
+  print('Speed : ${smoothed.speedKmh.toStringAsFixed(1)} km/h');
+
+  // Where will the driver be in 30 seconds?
+  final predicted = smoothed.predict(30);
+  print('Predicted lat/lng: ${predicted.latitude}, ${predicted.longitude}');
+
+  // ETA from driver position to rider
+  final etaSeconds = filter.estimateEtaSeconds(dLat, dLng, riderLat, riderLng);
+  if (etaSeconds != null) {
+    print('ETA: ${(etaSeconds / 60).toStringAsFixed(1)} min');
+  }
+});
+```
+
+**Constructor parameters**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `processNoise` | `0.5` | How much the filter trusts new readings vs. the model. Higher = more responsive, noisier. |
+| `measurementNoise` | `10.0` | Expected GPS horizontal error in metres. Higher = smoother, more lag. |
+
+---
+
+### GeofireVelocityGuard — GPS spoof & impossible-jump detection
+
+Compares consecutive location readings per driver and flags any update that implies a physically impossible speed (e.g. GPS spoofing).
+
+```dart
+final guard = GeofireVelocityGuard(maxSpeedKmh: 180);
+
+stream.listen((event) {
+  final key  = event['key'] as String;
+  final lat  = (event['latitude']  as num).toDouble();
+  final lng  = (event['longitude'] as num).toDouble();
+
+  final result = guard.check(key, lat, lng);
+
+  if (result.isSuspicious) {
+    // Discard or flag this update.
+    print('Suspicious location for $key: ${result.reason}');
+    // e.g. "Speed 8400.0 km/h exceeds limit of 180 km/h"
+  } else {
+    print('OK — speed: ${result.speedKmh.toStringAsFixed(1)} km/h');
+    // trust the location update
+  }
+});
+
+// Clear a driver's baseline when they go offline.
+guard.remove(driverKey);
+```
+
+**Constructor parameters**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `maxSpeedKmh` | `200.0` | Maximum plausible speed. Cars: 180–220, motorcycles: 200, walking: 10. |
+
+**`GeofireAnomalyResult` fields**
+
+| Field | Type | Description |
+|---|---|---|
+| `key` | `String` | The driver key. |
+| `isSuspicious` | `bool` | `true` when the jump exceeds `maxSpeedKmh`. |
+| `speedKmh` | `double` | Computed speed between the last two readings. |
+| `reason` | `String?` | Human-readable description when `isSuspicious` is `true`. |
+
+---
+
+### GeoFireSpatialCluster — deduplicate bunched drivers
+
+Groups a list of `GeofireDriverCandidate`s into spatial clusters so that several drivers parked in the same block appear as a single entry. The best-scored driver in each cluster is surfaced as the representative.
+
+```dart
+// Get candidates from queryDriverCandidatesAtLocation.
+Geofire.queryDriverCandidatesAtLocation(riderLat, riderLng, 5.0).listen((candidates) {
+
+  final clusters = GeoFireSpatialCluster.cluster(
+    candidates,
+    clusterRadiusKm: 0.5, // drivers within 500 m of the seed are grouped
+  );
+
+  for (final cluster in clusters) {
+    print('Cluster of ${cluster.size} driver(s) near '
+        '${cluster.centroidLat.toStringAsFixed(5)}, '
+        '${cluster.centroidLng.toStringAsFixed(5)}');
+    print('Best driver: ${cluster.bestCandidate.key} '
+        '(score: ${cluster.bestCandidate.score.toStringAsFixed(2)})');
+  }
+
+  // Show only one driver per cluster on the map.
+  final topDrivers = clusters.map((c) => c.bestCandidate).toList();
+});
+```
+
+**`cluster()` parameters**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `clusterRadiusKm` | `0.5` | Drivers within this radius of the seed are merged into one cluster. |
+
+**`GeofireCluster` fields**
+
+| Field | Type | Description |
+|---|---|---|
+| `centroidLat/Lng` | `double` | Average position of all members. |
+| `candidates` | `List<GeofireDriverCandidate>` | Every driver in the cluster. |
+| `bestCandidate` | `GeofireDriverCandidate` | Highest-score member — use this as the map pin. |
+| `size` | `int` | Number of drivers grouped. |
+
+---
+
+### Combining all three
+
+```dart
+final filters = <String, GeofireKalmanFilter>{};
+final guard   = GeofireVelocityGuard(maxSpeedKmh: 180);
+
+Geofire.queryDriverCandidatesAtLocation(riderLat, riderLng, 5.0).listen((candidates) {
+  final trusted = <GeofireDriverCandidate>[];
+
+  for (final c in candidates) {
+    // 1. Spoof check
+    final anomaly = guard.check(c.key, c.latitude, c.longitude);
+    if (anomaly.isSuspicious) continue;
+
+    // 2. Smooth + get ETA
+    final filter   = filters.putIfAbsent(c.key, () => GeofireKalmanFilter());
+    final smoothed = filter.update(c.latitude, c.longitude);
+    final eta      = filter.estimateEtaSeconds(
+        c.latitude, c.longitude, riderLat, riderLng);
+
+    print('${c.key}: ${smoothed.speedKmh.toStringAsFixed(1)} km/h, '
+        'ETA ${eta != null ? (eta / 60).toStringAsFixed(1) : "?"} min');
+
+    trusted.add(c);
+  }
+
+  // 3. Cluster remaining candidates
+  final clusters  = GeoFireSpatialCluster.cluster(trusted);
+  final topDrivers = clusters.map((cl) => cl.bestCandidate).toList();
+  // Render topDrivers on map.
+});
+```
 
 ## Contributing
 

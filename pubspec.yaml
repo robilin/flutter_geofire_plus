@@ -2,6 +2,13 @@ name: flutter_geofire_plus
 description: A Flutter plugin for realtime geospatial proximity queries with multi-backend support (Firebase, Firestore, Supabase, Postgres, MySQL), typed APIs, ride-dispatch helpers, and native background location tracking.
 version: 2.0.7
 
+topics:
+  - geolocation
+  - geofire
+  - firebase
+  - maps
+  - location
+
 
 environment:
   sdk: '>=2.12.0 <4.0.0'
@@ -10,7 +17,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  http: ^0.13.6
+  http: ^1.2.0
 
 # For information on the generic Dart part of this file, see the
 # following page: https://www.dartlang.org/tools/pub/pubspec
